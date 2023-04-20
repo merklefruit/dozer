@@ -13,6 +13,12 @@ use web3::{BatchTransport, Transport, Web3};
 
 use crate::errors::ConnectorError;
 
+#[derive(Debug, Clone)]
+pub struct BlockTrace {
+    pub block_number: u64,
+    pub result: TraceResult,
+}
+
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(crate = "self::serde", rename_all = "camelCase")]
 pub struct TraceResult {
@@ -37,7 +43,7 @@ pub struct Trace {
 pub async fn get_block_traces(
     tuple: (Web3<Batch<Http>>, Http),
     batch: (u64, u64),
-) -> Result<Vec<TraceResult>, ConnectorError> {
+) -> Result<Vec<BlockTrace>, ConnectorError> {
     debug_assert!(batch.0 < batch.1, "Batch start must be less than batch end");
     let (client, transport) = tuple;
     let mut requests = vec![];
@@ -56,22 +62,28 @@ pub async fn get_block_traces(
                 ),
             ],
         );
-        requests.push(request);
+        requests.push((block_no, request));
         request_count += 1;
     }
 
     let batch_results = transport
-        .send_batch(requests)
+        .send_batch(requests.into_iter().map(|(_, r)| r))
         .await
         .map_err(ConnectorError::EthError)?;
+
+    let batch_results_with_block_no = batch_results
+        .into_iter()
+        .zip(from..to)
+        .map(|(r, block_no)| (block_no, r))
+        .collect::<Vec<_>>();
 
     debug!(
         "Requests: {:?}, Results: {:?}",
         request_count,
-        batch_results.len(),
+        batch_results_with_block_no.len(),
     );
 
-    for (idx, res) in batch_results.iter().enumerate() {
+    for (idx, (block_no, res)) in batch_results_with_block_no.iter().enumerate() {
         let res = res.clone().map_err(|e| {
             error!("Error getting trace: {:?}", e);
             ConnectorError::EthError(e)
@@ -82,7 +94,15 @@ pub async fn get_block_traces(
 
         debug!("Idx: {} : Response: {:?}", idx, r);
 
-        results.extend(r);
+        let block_traces = r
+            .into_iter()
+            .map(|r| BlockTrace {
+                block_number: *block_no,
+                result: r,
+            })
+            .collect::<Vec<_>>();
+
+        results.extend(block_traces);
     }
     Ok(results)
 }
@@ -94,6 +114,12 @@ pub fn get_trace_schema() -> Schema {
     Schema {
         identifier: Some(get_schema_id()),
         fields: vec![
+            FieldDefinition {
+                name: "block_number".to_string(),
+                typ: FieldType::UInt,
+                nullable: true,
+                source: SourceDefinition::Dynamic,
+            },
             FieldDefinition {
                 name: "type_field".to_string(),
                 typ: FieldType::String,
@@ -147,27 +173,38 @@ pub fn get_trace_schema() -> Schema {
     }
 }
 
-pub fn map_trace_to_ops(trace: &Trace) -> Vec<Operation> {
+pub fn map_trace_to_ops(block_no: Option<u64>, trace: &Trace) -> Vec<Operation> {
     let mut ops = vec![];
+
+    let mut values = vec![];
+    if let Some(block_no) = block_no {
+        values.push(Field::UInt(block_no));
+    } else {
+        values.push(Field::Null);
+    }
+
+    values.extend(vec![
+        Field::String(trace.type_field.clone()),
+        Field::String(format!("{:?}", trace.from)),
+        Field::String(format!("{:?}", trace.to)),
+        Field::UInt(trace.value.unwrap_or(U256::zero()).low_u64()),
+        Field::UInt(trace.gas.low_u64()),
+        Field::UInt(trace.gas_used.low_u64()),
+        Field::Text(format!("{:?}", trace.input)),
+        Field::Text(format!("{:?}", trace.output)),
+    ]);
+
     let op = Operation::Insert {
         new: Record {
             schema_id: Some(get_schema_id()),
-            values: vec![
-                Field::String(trace.type_field.clone()),
-                Field::String(format!("{:?}", trace.from)),
-                Field::String(format!("{:?}", trace.to)),
-                Field::UInt(trace.value.unwrap_or(U256::zero()).low_u64()),
-                Field::UInt(trace.gas.low_u64()),
-                Field::UInt(trace.gas_used.low_u64()),
-                Field::Text(format!("{:?}", trace.input)),
-                Field::Text(format!("{:?}", trace.output)),
-            ],
+            values,
         },
     };
+
     ops.push(op);
     if let Some(calls) = &trace.calls {
         for call in calls {
-            ops.append(&mut map_trace_to_ops(call));
+            ops.append(&mut map_trace_to_ops(None, call));
         }
     }
     ops

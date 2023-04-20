@@ -147,8 +147,11 @@ pub async fn run(
             let res = get_block_traces(client_tuple.clone(), batch).await;
             match res {
                 Ok(arr) => {
-                    for result in arr {
-                        let ops = map_trace_to_ops(&result.result);
+                    for block_trace in arr {
+                        let ops = map_trace_to_ops(
+                            Some(block_trace.block_number),
+                            &block_trace.result.result,
+                        );
 
                         for op in ops {
                             ingestor
